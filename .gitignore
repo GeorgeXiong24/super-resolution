@@ -1,0 +1,24 @@
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Test images and generated outputs (personal/generated content — not for open source)
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.webp
+*.tif
+*.tiff
+*.heic
+*.heif
+*.avif
