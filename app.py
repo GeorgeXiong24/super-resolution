@@ -1,21 +1,13 @@
+"""Deterministic single-image super-resolution based on a regularised inverse problem.
+
+The image formation model blurs a high-resolution candidate with a Gaussian
+point-spread function then area-samples it.  Each residual is propagated by
+the adjoint of that exact model.  Edge-aware Huber total variation keeps the
+optimisation stable without blurring strong boundaries; chroma uses Lanczos
+resampling so reconstructed luminance edges do not acquire colour fringes.
 """
-Advanced single-image super-resolution without machine learning.
 
-Core algorithm
---------------
-Iterative Back Projection (IBP) with Bilateral Total Variation (BTV)
-regularization.
-
-* IBP enforces the physical consistency constraint: if the reconstructed
-  high-resolution image is blurred by the estimated Point Spread Function (PSF)
-  and down-sampled, it should reproduce the observed low-resolution image.
-* BTV regularization suppresses ringing and noise amplification while
-  preserving sharp edges by penalising intensity differences weighted by
-  spatial distance.
-
-A high-quality Lanczos separable interpolation is used for the initial
-estimate and for propagating the residual back to the high-resolution grid.
-"""
+from __future__ import annotations
 
 import argparse
 import os
@@ -27,370 +19,301 @@ from PIL import Image
 
 try:
     import pillow_heif
-
     pillow_heif.register_heif_opener()
 except ImportError:
     pillow_heif = None
 
 
+def _validate_parameters(scale: int, iterations: int, lambda_ibp: float,
+                         sigma_psf: float, lambda_tv: float,
+                         edge_threshold: float, detail_amount: float) -> None:
+    if scale < 2:
+        raise ValueError("scale must be an integer of at least 2")
+    if iterations < 1:
+        raise ValueError("iterations must be at least 1")
+    if lambda_ibp <= 0 or sigma_psf <= 0 or lambda_tv < 0:
+        raise ValueError("IBP step and PSF sigma must be positive; TV strength cannot be negative")
+    if edge_threshold <= 0:
+        raise ValueError("edge_threshold must be positive")
+    if not 0 <= detail_amount <= 1:
+        raise ValueError("detail_amount must be in the range [0, 1]")
+
+
 # ---------------------------------------------------------------------------
-# Utility kernels and convolution
+# Resampling and the image-formation model
 # ---------------------------------------------------------------------------
 
 def _lanczos_kernel(x: np.ndarray, a: int = 3) -> np.ndarray:
-    """Lanczos windowed sinc kernel, vectorised."""
-    x = np.abs(x).astype(np.float64)
-    out = np.zeros_like(x)
-    zero = x < 1e-9
-    inside = (x < a) & ~zero
-    out[zero] = 1.0
-    x_in = x[inside]
-    out[inside] = (
-        a * np.sin(np.pi * x_in) * np.sin(np.pi * x_in / a)
-        / (np.pi ** 2 * x_in ** 2)
-    )
-    return out
+    """Lanczos (windowed-sinc) interpolation kernel."""
+    x = np.abs(np.asarray(x, dtype=np.float64))
+    result = np.zeros_like(x)
+    at_origin = x < 1e-12
+    inside = (x < a) & ~at_origin
+    result[at_origin] = 1.0
+    xi = x[inside]
+    result[inside] = a * np.sin(np.pi * xi) * np.sin(np.pi * xi / a) / (np.pi**2 * xi**2)
+    return result
 
 
-def _gaussian_kernel(sigma: float, size: Optional[int] = None) -> np.ndarray:
-    """Create a normalised 1-D Gaussian kernel."""
-    if size is None:
-        size = max(7, int(6 * sigma) | 1)  # odd, at least 7
-    if size % 2 == 0:
-        size += 1
-    r = np.arange(size) - size // 2
-    k = np.exp(-(r ** 2) / (2.0 * sigma ** 2))
-    return k / k.sum()
+def _reflect_indices(indices: np.ndarray, size: int) -> np.ndarray:
+    """Map arbitrary indices onto [0, size) with reflect-101 boundaries."""
+    if size == 1:
+        return np.zeros_like(indices)
+    period = 2 * size - 2
+    reflected = np.mod(indices, period)
+    return np.where(reflected < size, reflected, period - reflected)
 
 
-def _convolve_separable(img: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    """Apply a separable convolution with reflect padding."""
-    if img.ndim == 2:
-        img = img[..., None]
-        squeeze = True
-    else:
-        squeeze = False
-
-    pad = len(kernel) // 2
-    h, w, c = img.shape
-    tmp = np.empty((h, w, c), dtype=np.float64)
-    out = np.empty((h, w, c), dtype=np.float64)
-
-    kernel = kernel.astype(np.float64)
-
-    # Horizontal pass
-    for i in range(h):
-        for ch in range(c):
-            row = np.pad(img[i, :, ch], pad, mode="reflect")
-            tmp[i, :, ch] = np.convolve(row, kernel, mode="same")[pad:-pad]
-
-    # Vertical pass
-    for j in range(w):
-        for ch in range(c):
-            col = np.pad(tmp[:, j, ch], pad, mode="reflect")
-            out[:, j, ch] = np.convolve(col, kernel, mode="same")[pad:-pad]
-
-    return out[..., 0] if squeeze else out
+def _lanczos_taps(source_size: int, destination_size: int, a: int = 3) -> tuple[np.ndarray, np.ndarray]:
+    destination = np.arange(destination_size, dtype=np.float64)
+    coordinate = (destination + 0.5) * source_size / destination_size - 0.5
+    offsets = np.arange(-a + 1, a + 1)
+    raw_indices = np.floor(coordinate).astype(int)[:, None] + offsets[None, :]
+    weights = _lanczos_kernel(coordinate[:, None] - raw_indices, a)
+    weights /= weights.sum(axis=1, keepdims=True)
+    return _reflect_indices(raw_indices, source_size), weights
 
 
-# ---------------------------------------------------------------------------
-# Interpolation and resampling
-# ---------------------------------------------------------------------------
-
-def _lanczos_weights(src_size: int, dst_size: int, a: int = 3) -> np.ndarray:
-    """
-    Build a (dst_size, src_size) weight matrix for 1-D Lanczos resampling.
-    Each row is normalised to sum to 1.
-    """
-    scale = dst_size / src_size
-    weights = np.zeros((dst_size, src_size), dtype=np.float64)
-    for i in range(dst_size):
-        # Pixel centre in source coordinate space
-        u = (i + 0.5) / scale - 0.5
-        left = int(np.floor(u - a + 1))
-        right = int(np.ceil(u + a))
-        support = np.arange(left, right + 1)
-        valid = (support >= 0) & (support < src_size)
-        support = support[valid]
-        vals = _lanczos_kernel(u - support, a)
-        s = vals.sum()
-        if s > 0:
-            vals /= s
-        weights[i, support] = vals
-    return weights
+def lanczos_resize(img: np.ndarray, scale: int, a: int = 3) -> np.ndarray:
+    """Upscale a gray or RGB image with separable Lanczos interpolation."""
+    image = np.asarray(img, dtype=np.float64)
+    is_gray = image.ndim == 2
+    if is_gray:
+        image = image[..., None]
+    if image.ndim != 3:
+        raise ValueError("image must have shape (height, width) or (height, width, channels)")
+    height, width, channels = image.shape
+    target_height, target_width = height * scale, width * scale
+    x_indices, x_weights = _lanczos_taps(width, target_width, a)
+    horizontal = np.zeros((height, target_width, channels), dtype=np.float64)
+    for tap in range(x_weights.shape[1]):
+        horizontal += image[:, x_indices[:, tap], :] * x_weights[None, :, tap, None]
+    y_indices, y_weights = _lanczos_taps(height, target_height, a)
+    result = np.zeros((target_height, target_width, channels), dtype=np.float64)
+    for tap in range(y_weights.shape[1]):
+        result += horizontal[y_indices[:, tap], :, :] * y_weights[:, tap, None, None]
+    return result[..., 0] if is_gray else result
 
 
-def lanczos_resize(img: np.ndarray, scale: float, a: int = 3) -> np.ndarray:
-    """
-    Resize ``img`` by ``scale`` using separable Lanczos resampling.
-    Returns float64 array in [0, 255] range preserving channel count.
-    """
-    img = np.asarray(img, dtype=np.float64)
-    squeeze = False
-    if img.ndim == 2:
-        img = img[..., None]
-        squeeze = True
-
-    h, w, c = img.shape
-    new_h = max(1, int(round(h * scale)))
-    new_w = max(1, int(round(w * scale)))
-
-    W = _lanczos_weights(w, new_w, a)
-    H = _lanczos_weights(h, new_h, a)
-
-    # Horizontal then vertical: out = H @ (img @ W.T)
-    out = np.empty((new_h, new_w, c), dtype=np.float64)
-    for ch in range(c):
-        horiz = img[:, :, ch] @ W.T          # (h, new_w)
-        out[:, :, ch] = H @ horiz            # (new_h, new_w)
-
-    if squeeze:
-        out = out[..., 0]
-    return np.clip(out, 0.0, 255.0)
+def _gaussian_kernel(sigma: float) -> np.ndarray:
+    radius = max(2, int(np.ceil(3.0 * sigma)))
+    coordinates = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-(coordinates**2) / (2.0 * sigma**2))
+    return kernel / kernel.sum()
 
 
-def downsample_area(img: np.ndarray, scale: int) -> np.ndarray:
-    """
-    Integer-scale area downsampling by averaging non-overlapping scale x scale
-    blocks.
-    """
-    img = np.asarray(img, dtype=np.float64)
-    squeeze = False
-    if img.ndim == 2:
-        img = img[..., None]
-        squeeze = True
-
-    h, w, c = img.shape
-    new_h, new_w = h // scale, w // scale
-    img = img[: new_h * scale, : new_w * scale]
-    blocks = img.reshape(
-        new_h, scale, new_w, scale, c
-    ).transpose(0, 2, 4, 1, 3).reshape(new_h, new_w, c, scale * scale)
-    out = blocks.mean(axis=-1)
-    return out[..., 0] if squeeze else out
+def _convolve_separable(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Separable reflect-boundary convolution, vectorised across rows and channels."""
+    source = np.asarray(image, dtype=np.float64)
+    is_gray = source.ndim == 2
+    if is_gray:
+        source = source[..., None]
+    radius = len(kernel) // 2
+    height, width, _ = source.shape
+    padded_y = np.pad(source, ((radius, radius), (0, 0), (0, 0)), mode="reflect")
+    horizontal = np.zeros_like(source)
+    for offset, weight in enumerate(kernel):
+        horizontal += weight * padded_y[offset:offset + height, :, :]
+    padded_x = np.pad(horizontal, ((0, 0), (radius, radius), (0, 0)), mode="reflect")
+    result = np.zeros_like(source)
+    for offset, weight in enumerate(kernel):
+        result += weight * padded_x[:, offset:offset + width, :]
+    return result[..., 0] if is_gray else result
 
 
-# ---------------------------------------------------------------------------
-# Iterative Back Projection + BTV regularization
-# ---------------------------------------------------------------------------
-
-def _btv_regularize(
-    img: np.ndarray,
-    lambda_btv: float,
-    alpha_btv: float,
-    neighbors: int = 1,
-) -> np.ndarray:
-    """
-    One gradient-descent step of Bilateral Total Variation regularization.
-
-    Minimises  sum_{(l,m) in neighborhood} alpha^{|l|+|m|}
-               || img - shift(img, (l,m)) ||_1
-    """
-    out = img.copy()
-    total_weight = 0.0
-    for dy in range(-neighbors, neighbors + 1):
-        for dx in range(-neighbors, neighbors + 1):
-            if dx == 0 and dy == 0:
-                continue
-            weight = alpha_btv ** (abs(dx) + abs(dy))
-            total_weight += weight
-            shifted = np.roll(img, (dy, dx), axis=(0, 1))
-            out -= lambda_btv * weight * np.sign(img - shifted)
-    if total_weight > 0:
-        out /= 1.0 + lambda_btv * total_weight
-    return out
-
-
-def ibp_btv_super_resolve(
-    lr: np.ndarray,
-    scale: int,
-    iterations: int = 25,
-    lambda_ibp: float = 1.2,
-    sigma_psf: float = 1.0,
-    lambda_btv: float = 0.04,
-    alpha_btv: float = 0.7,
-    btv_neighbors: int = 1,
-) -> np.ndarray:
-    """
-    Single-image super-resolution by Iterative Back Projection with BTV
-    regularisation.
-
-    Parameters
-    ----------
-    lr : np.ndarray
-        Low-resolution image, uint8 or float in [0, 255].
-    scale : int
-        Integer upscaling factor.
-    iterations : int
-        Number of IBP iterations.
-    lambda_ibp : float
-        Step size for the back-projected residual.
-    sigma_psf : float
-        Standard deviation of the Gaussian Point Spread Function used to
-        simulate the imaging blur.
-    lambda_btv : float
-        Strength of the BTV regularisation term.
-    alpha_btv : float
-        Spatial damping factor for the BTV weights (0 < alpha < 1).
-    btv_neighbors : int
-        Maximum shift distance included in the BTV neighbourhood.
-    """
-    lr = np.asarray(lr, dtype=np.float64)
-    hr = lanczos_resize(lr, scale, a=3)
-    psf_kernel = _gaussian_kernel(sigma_psf)
-
-    for _ in range(iterations):
-        # Simulate observed low-resolution image
-        blurred = _convolve_separable(hr, psf_kernel)
-        lr_sim = downsample_area(blurred, scale)
-
-        # Residual in LR space, back-projected to HR space
-        residual_lr = lr - lr_sim
-        residual_hr = lanczos_resize(residual_lr, scale, a=2)
-
-        # Update
-        hr = hr + lambda_ibp * residual_hr
-
-        # BTV regularisation
-        hr = _btv_regularize(
-            hr, lambda_btv=lambda_btv, alpha_btv=alpha_btv,
-            neighbors=btv_neighbors,
+def _convolution_axis_adjoint(image: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarray:
+    """Transpose of one reflect-boundary convolution axis."""
+    source = np.asarray(image, dtype=np.float64)
+    if axis == 1:
+        return np.swapaxes(
+            _convolution_axis_adjoint(np.swapaxes(source, 0, 1), kernel, 0), 0, 1
         )
+    radius = len(kernel) // 2
+    length = source.shape[0]
+    result = np.zeros_like(source)
+    base_indices = np.arange(length)
+    for offset, weight in enumerate(kernel):
+        source_indices = _reflect_indices(base_indices + offset - radius, length)
+        np.add.at(result, source_indices, weight * source)
+    return result
 
-        hr = np.clip(hr, 0.0, 255.0)
 
-    return hr
+def _convolve_separable_adjoint(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Exact transpose of ``_convolve_separable`` for reflect boundaries."""
+    source = np.asarray(image, dtype=np.float64)
+    is_gray = source.ndim == 2
+    if is_gray:
+        source = source[..., None]
+    # The forward operator applies vertical then horizontal filtering, so its
+    # transpose applies the horizontal transpose then the vertical transpose.
+    result = _convolution_axis_adjoint(
+        _convolution_axis_adjoint(source, kernel, 1), kernel, 0
+    )
+    return result[..., 0] if is_gray else result
+
+
+def downsample_area(image: np.ndarray, scale: int) -> np.ndarray:
+    """Forward sampling operator: average non-overlapping scale-by-scale blocks."""
+    source = np.asarray(image, dtype=np.float64)
+    is_gray = source.ndim == 2
+    if is_gray:
+        source = source[..., None]
+    height, width, channels = source.shape
+    if height % scale or width % scale:
+        raise ValueError("high-resolution dimensions must be divisible by scale")
+    result = source.reshape(height // scale, scale, width // scale, scale, channels).mean(axis=(1, 3))
+    return result[..., 0] if is_gray else result
+
+
+def _area_adjoint(residual: np.ndarray, scale: int) -> np.ndarray:
+    """Adjoint of area sampling: spread a residual over its contributing block."""
+    source = np.asarray(residual, dtype=np.float64)
+    return np.repeat(np.repeat(source, scale, axis=0), scale, axis=1) / (scale * scale)
 
 
 # ---------------------------------------------------------------------------
-# Simple interpolation baseline
+# Edge-aware reconstruction in luminance space
 # ---------------------------------------------------------------------------
 
-def bicubic_resize(img: np.ndarray, scale: float) -> np.ndarray:
+def _rgb_to_ycbcr(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    source = np.asarray(rgb, dtype=np.float64)
+    red, green, blue = source[..., 0], source[..., 1], source[..., 2]
+    y = 0.299 * red + 0.587 * green + 0.114 * blue
+    cb = 128.0 - 0.168736 * red - 0.331264 * green + 0.5 * blue
+    cr = 128.0 + 0.5 * red - 0.418688 * green - 0.081312 * blue
+    return y, cb, cr
+
+
+def _ycbcr_to_rgb(y: np.ndarray, cb: np.ndarray, cr: np.ndarray) -> np.ndarray:
+    cb, cr = cb - 128.0, cr - 128.0
+    return np.stack((y + 1.402 * cr, y - 0.344136 * cb - 0.714136 * cr, y + 1.772 * cb), axis=-1)
+
+
+def _edge_weights(reference: np.ndarray, edge_threshold: float) -> tuple[np.ndarray, np.ndarray]:
+    """Large smoothing weights in flat areas and small weights across edges."""
+    horizontal = 1.0 / (1.0 + (np.abs(np.diff(reference, axis=1)) / edge_threshold) ** 2)
+    vertical = 1.0 / (1.0 + (np.abs(np.diff(reference, axis=0)) / edge_threshold) ** 2)
+    return horizontal, vertical
+
+
+def _edge_aware_huber_tv_step(image: np.ndarray, horizontal_weight: np.ndarray,
+                               vertical_weight: np.ndarray, strength: float,
+                               huber_scale: float = 4.0) -> np.ndarray:
+    """One stable anisotropic Huber-TV diffusion step with no boundary wrapping."""
+    if strength == 0:
+        return image
+    dx = image[:, 1:] - image[:, :-1]
+    dy = image[1:, :] - image[:-1, :]
+    flux_x = horizontal_weight * dx / np.sqrt(dx * dx + huber_scale * huber_scale)
+    flux_y = vertical_weight * dy / np.sqrt(dy * dy + huber_scale * huber_scale)
+    update = np.zeros_like(image)
+    update[:, :-1] += flux_x
+    update[:, 1:] -= flux_x
+    update[:-1, :] += flux_y
+    update[1:, :] -= flux_y
+    return image + strength * update
+
+
+def _edge_limited_detail(image: np.ndarray, amount: float, edge_threshold: float) -> np.ndarray:
+    """Mild final detail lift, bounded by a local edge-strength mask."""
+    if amount == 0:
+        return image
+    blurred = _convolve_separable(image, _gaussian_kernel(0.65))
+    gradient_x = np.zeros_like(image)
+    gradient_y = np.zeros_like(image)
+    gradient_x[:, 1:] = np.abs(image[:, 1:] - image[:, :-1])
+    gradient_y[1:, :] = np.abs(image[1:, :] - image[:-1, :])
+    edge = np.hypot(gradient_x, gradient_y)
+    return image + amount * edge / (edge + edge_threshold) * (image - blurred)
+
+
+def ibp_btv_super_resolve(lr: np.ndarray, scale: int, iterations: int = 20,
+                           lambda_ibp: float = 1.0, sigma_psf: float = 0.85,
+                           lambda_btv: float = 0.08, alpha_btv: float = 0.7,
+                           btv_neighbors: int = 1, edge_threshold: float = 12.0,
+                           detail_amount: float = 0.12) -> np.ndarray:
+    """Reconstruct an RGB image with adjoint IBP and edge-aware Huber-TV.
+
+    ``alpha_btv`` and ``btv_neighbors`` remain accepted for API compatibility
+    but are intentionally unused: data-derived edge weights replace the old
+    circularly shifted BTV neighbourhood, eliminating wraparound artifacts.
     """
-    Pillow's built-in bicubic resize, exposed as a numpy-based baseline.
-    """
-    mode = "L" if img.ndim == 2 else "RGB"
-    pil = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8), mode=mode)
-    new_h = max(1, int(round(img.shape[0] * scale)))
-    new_w = max(1, int(round(img.shape[1] * scale)))
-    resized = pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
-    return np.asarray(resized, dtype=np.float64)
+    _validate_parameters(scale, iterations, lambda_ibp, sigma_psf, lambda_btv, edge_threshold, detail_amount)
+    source = np.asarray(lr, dtype=np.float64)
+    if source.ndim != 3 or source.shape[2] != 3:
+        raise ValueError("lr must be an RGB array with shape (height, width, 3)")
+    y_lr, cb_lr, cr_lr = _rgb_to_ycbcr(source)
+    y_hr = lanczos_resize(y_lr, scale)
+    cb_hr, cr_hr = lanczos_resize(cb_lr, scale), lanczos_resize(cr_lr, scale)
+    psf = _gaussian_kernel(sigma_psf)
+    horizontal_weight, vertical_weight = _edge_weights(y_hr, edge_threshold)
+    for _ in range(iterations):
+        simulated_lr = downsample_area(_convolve_separable(y_hr, psf), scale)
+        residual_lr = y_lr - simulated_lr
+        correction = _convolve_separable_adjoint(_area_adjoint(residual_lr, scale), psf)
+        y_hr += lambda_ibp * correction
+        y_hr = _edge_aware_huber_tv_step(y_hr, horizontal_weight, vertical_weight, lambda_btv)
+        y_hr = np.clip(y_hr, 0.0, 255.0)
+    y_hr = _edge_limited_detail(y_hr, detail_amount, edge_threshold)
+    return np.clip(_ycbcr_to_rgb(y_hr, cb_hr, cr_hr), 0.0, 255.0)
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Command line interface
 # ---------------------------------------------------------------------------
 
-def _resolve_output_path(input_path: str, scale: int, ext: Optional[str]) -> str:
-    base, in_ext = os.path.splitext(input_path)
-    out_ext = ext if ext is not None else in_ext
-    return f"{base}_x{scale}{out_ext}"
+def _resolve_output_path(input_path: str, scale: int, extension: Optional[str]) -> str:
+    base, input_extension = os.path.splitext(input_path)
+    return f"{base}_x{scale}{extension if extension is not None else input_extension}"
+
+
+def _read_rgb(path: str) -> np.ndarray:
+    with Image.open(path) as image:
+        return np.asarray(image.convert("RGB"), dtype=np.uint8)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Advanced non-AI single-image super-resolution."
-    )
-    parser.add_argument(
-        "image",
-        nargs="?",
-        help="Path to the image to upscale. If omitted, a prompt is shown.",
-    )
-    parser.add_argument(
-        "-s", "--scale", type=int, default=2,
-        help="Integer upscaling factor (default: 2).",
-    )
-    parser.add_argument(
-        "-m", "--method", choices=["ibp-btv", "lanczos"], default="ibp-btv",
-        help=(
-            "Super-resolution method. 'ibp-btv' (default) uses Iterative Back "
-            "Projection with Bilateral Total Variation regularisation; "
-            "'lanczos' uses high-quality Lanczos resampling only."
-        ),
-    )
-    parser.add_argument(
-        "-i", "--iterations", type=int, default=25,
-        help="IBP iterations (default: 25).",
-    )
-    parser.add_argument(
-        "--lambda-ibp", type=float, default=1.2,
-        help="IBP residual step size (default: 1.2).",
-    )
-    parser.add_argument(
-        "--sigma-psf", type=float, default=1.0,
-        help="Gaussian PSF sigma simulating the imaging blur (default: 1.0).",
-    )
-    parser.add_argument(
-        "--lambda-btv", type=float, default=0.04,
-        help="BTV regularisation strength (default: 0.04).",
-    )
-    parser.add_argument(
-        "--alpha-btv", type=float, default=0.7,
-        help="BTV spatial damping factor (default: 0.7).",
-    )
-    parser.add_argument(
-        "-o", "--output", default=None,
-        help="Output path. Default is '<input>_x<scale>.<ext>'.",
-    )
-    parser.add_argument(
-        "-q", "--quality", type=int, default=95,
-        help="JPEG/WebP output quality (default: 95).",
-    )
+    parser = argparse.ArgumentParser(description="Deterministic super-resolution using adjoint IBP and edge-aware Huber-TV.")
+    parser.add_argument("image", nargs="?", help="Path to the image to upscale. If omitted, a prompt is shown.")
+    parser.add_argument("-s", "--scale", type=int, default=2, help="Integer upscaling factor, at least 2 (default: 2).")
+    parser.add_argument("-m", "--method", choices=["ibp-btv", "lanczos"], default="ibp-btv", help="'ibp-btv' (default) or fast 'lanczos'.")
+    parser.add_argument("-i", "--iterations", type=int, default=20, help="IBP iterations (default: 20).")
+    parser.add_argument("--lambda-ibp", type=float, default=1.0, help="IBP residual step size (default: 1.0).")
+    parser.add_argument("--sigma-psf", type=float, default=0.85, help="Gaussian PSF sigma in HR pixels (default: 0.85).")
+    parser.add_argument("--lambda-btv", type=float, default=0.08, help="Edge-aware Huber-TV strength (default: 0.08).")
+    parser.add_argument("--edge-threshold", type=float, default=12.0, help="Edge-preservation threshold in luma levels (default: 12).")
+    parser.add_argument("--detail-amount", type=float, default=0.12, help="Bounded final edge-detail lift from 0 to 1 (default: 0.12).")
+    parser.add_argument("-o", "--output", default=None, help="Output path. Default is '<input>_x<scale>.<ext>'.")
+    parser.add_argument("-q", "--quality", type=int, default=95, help="JPEG/WebP output quality (default: 95).")
     args = parser.parse_args()
-
-    if args.image:
-        path = args.image
-    else:
-        path = input("Enter the path of the image to upscale: ").strip().strip('"').strip("'")
-
+    path = args.image or input("Enter the path of the image to upscale: ").strip().strip('"').strip("'")
     if not os.path.isfile(path):
         print(f"File not found: {path}", file=sys.stderr)
         return 1
-
-    ext = os.path.splitext(path)[1].lower()
-    if ext in (".heic", ".heif", ".avif"):
+    extension = os.path.splitext(path)[1].lower()
+    if extension in (".heic", ".heif", ".avif"):
         if pillow_heif is None:
-            print(
-                "Reading HEIC/HEIF/AVIF requires pillow-heif: "
-                "pip install pillow-heif",
-                file=sys.stderr,
-            )
+            print("Reading HEIC/HEIF/AVIF requires pillow-heif: pip install pillow-heif", file=sys.stderr)
             return 1
-        out_ext = ".jpg"
-    elif ext == ".jpeg":
-        out_ext = ".jpg"
+        output_extension = ".jpg"
     else:
-        out_ext = ext
-
-    img = np.array(Image.open(path).convert("RGB"))
-    print(
-        f"Input: {path} ({img.shape[1]}x{img.shape[0]}), scale={args.scale}, "
-        f"method={args.method}"
-    )
-
-    if args.method == "lanczos":
-        result = lanczos_resize(img, args.scale)
-    else:
-        result = ibp_btv_super_resolve(
-            img,
-            scale=args.scale,
-            iterations=args.iterations,
-            lambda_ibp=args.lambda_ibp,
-            sigma_psf=args.sigma_psf,
-            lambda_btv=args.lambda_btv,
-            alpha_btv=args.alpha_btv,
-        )
-
-    result = np.clip(result, 0, 255).astype(np.uint8)
-
-    dst = args.output or _resolve_output_path(path, args.scale, out_ext)
-
-    save_kwargs: dict = {}
-    if out_ext in (".jpg", ".jpeg", ".webp"):
+        output_extension = ".jpg" if extension == ".jpeg" else extension
+    try:
+        _validate_parameters(args.scale, args.iterations, args.lambda_ibp, args.sigma_psf, args.lambda_btv, args.edge_threshold, args.detail_amount)
+        image = _read_rgb(path)
+        if args.method == "lanczos":
+            result = lanczos_resize(image, args.scale)
+        else:
+            result = ibp_btv_super_resolve(image, args.scale, args.iterations, args.lambda_ibp, args.sigma_psf, args.lambda_btv, edge_threshold=args.edge_threshold, detail_amount=args.detail_amount)
+    except (OSError, ValueError) as error:
+        print(f"Could not process image: {error}", file=sys.stderr)
+        return 1
+    destination = args.output or _resolve_output_path(path, args.scale, output_extension)
+    save_kwargs: dict[str, int] = {}
+    if output_extension in (".jpg", ".jpeg", ".webp"):
         save_kwargs["quality"] = args.quality
-    Image.fromarray(result).save(dst, **save_kwargs)
-    print(f"Saved: {dst} ({result.shape[1]}x{result.shape[0]})")
+    Image.fromarray(np.clip(result, 0, 255).astype(np.uint8), mode="RGB").save(destination, **save_kwargs)
+    print(f"Saved: {destination} ({result.shape[1]}x{result.shape[0]})")
     return 0
 
 
