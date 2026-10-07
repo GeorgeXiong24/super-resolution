@@ -214,8 +214,89 @@ def _edge_aware_huber_tv_step(image: np.ndarray, horizontal_weight: np.ndarray,
     return image + strength * update
 
 
-def _edge_limited_detail(image: np.ndarray, amount: float, edge_threshold: float) -> np.ndarray:
-    """Mild final detail lift, bounded by a local edge-strength mask."""
+def _estimate_noise_level(luma: np.ndarray) -> float:
+    """Robust median-absolute-deviation estimate of high-frequency noise."""
+    laplacian = np.zeros_like(luma)
+    laplacian[1:-1, 1:-1] = (
+        4.0 * luma[1:-1, 1:-1]
+        - luma[:-2, 1:-1]
+        - luma[2:, 1:-1]
+        - luma[1:-1, :-2]
+        - luma[1:-1, 2:]
+    )
+    median = np.median(laplacian)
+    mad = np.median(np.abs(laplacian - median)) / 0.6745
+    return float(np.clip(mad, 0.5, 30.0))
+
+
+def _local_variance(image: np.ndarray, radius: int = 2) -> np.ndarray:
+    """Local variance computed with a small separable box filter."""
+    size = 2 * radius + 1
+    kernel = np.ones(size, dtype=np.float64) / size
+    mean = _convolve_separable(image, kernel)
+    mean_sq = _convolve_separable(image * image, kernel)
+    return np.clip(mean_sq - mean * mean, 0.0, None)
+
+
+def _adaptive_parameters(
+    y_lr: np.ndarray,
+    scale: int,
+    lambda_btv: float,
+    edge_threshold: float,
+    sigma_psf: float,
+    detail_amount: float,
+) -> tuple[float, float, float, float, np.ndarray]:
+    """Derive per-image parameters from estimated noise and local texture."""
+    noise = _estimate_noise_level(y_lr)
+    activity_lr = np.sqrt(_local_variance(y_lr, radius=2))
+    mean_activity = max(1.0, float(np.mean(activity_lr)))
+    noise_ratio = np.clip(noise / 8.0, 0.5, 2.5)
+    texture_ratio = np.clip(mean_activity / 8.0, 0.6, 1.8)
+
+    # More noise -> stronger regularisation; more texture -> less aggressive smoothing
+    adapted_lambda_btv = lambda_btv * noise_ratio / np.sqrt(texture_ratio)
+    # Higher thresholds tolerate noise better, lower thresholds preserve thin edges
+    adapted_edge_threshold = edge_threshold * noise_ratio * (1.0 - 0.15 * (texture_ratio - 1.0))
+    # A slightly wider PSF is safer for noisy sources
+    adapted_sigma_psf = sigma_psf * (1.0 + 0.12 * (noise_ratio - 1.0))
+    # Boost detail in textured content, but keep it bounded
+    adapted_detail = min(1.0, detail_amount * (1.0 + 0.4 * (texture_ratio - 1.0)))
+
+    # Upscale activity map to HR for region-aware processing
+    activity_hr = lanczos_resize(activity_lr, scale)
+    return (
+        float(np.clip(adapted_lambda_btv, 0.0, 1.0)),
+        float(np.clip(adapted_edge_threshold, 1.0, 64.0)),
+        float(np.clip(adapted_sigma_psf, 0.2, 2.5)),
+        float(np.clip(adapted_detail, 0.0, 1.0)),
+        activity_hr,
+    )
+
+
+def _adaptive_edge_weights(
+    reference: np.ndarray,
+    edge_threshold: float,
+    activity: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Edge-aware weights that also reduce smoothing over fine texture."""
+    horizontal = 1.0 / (1.0 + (np.abs(np.diff(reference, axis=1)) / edge_threshold) ** 2)
+    vertical = 1.0 / (1.0 + (np.abs(np.diff(reference, axis=0)) / edge_threshold) ** 2)
+
+    activity_h = np.minimum(activity[:, 1:], activity[:, :-1])
+    activity_v = np.minimum(activity[1:, :], activity[:-1, :])
+    texture_h = 1.0 / (1.0 + (activity_h / (edge_threshold * 0.6)) ** 2)
+    texture_v = 1.0 / (1.0 + (activity_v / (edge_threshold * 0.6)) ** 2)
+
+    return horizontal * texture_h, vertical * texture_v
+
+
+def _adaptive_detail_lift(
+    image: np.ndarray,
+    amount: float,
+    edge_threshold: float,
+    activity: np.ndarray,
+) -> np.ndarray:
+    """Edge- and texture-bounded final detail enhancement."""
     if amount == 0:
         return image
     blurred = _convolve_separable(image, _gaussian_kernel(0.65))
@@ -224,19 +305,28 @@ def _edge_limited_detail(image: np.ndarray, amount: float, edge_threshold: float
     gradient_x[:, 1:] = np.abs(image[:, 1:] - image[:, :-1])
     gradient_y[1:, :] = np.abs(image[1:, :] - image[:-1, :])
     edge = np.hypot(gradient_x, gradient_y)
-    return image + amount * edge / (edge + edge_threshold) * (image - blurred)
+
+    edge_mask = edge / (edge + edge_threshold)
+    texture_mask = activity / (activity + edge_threshold * 0.5)
+    mask = np.clip(edge_mask + 0.25 * texture_mask, 0.0, 1.0)
+    return image + amount * mask * (image - blurred)
 
 
 def ibp_btv_super_resolve(lr: np.ndarray, scale: int, iterations: int = 20,
                            lambda_ibp: float = 1.0, sigma_psf: float = 0.85,
                            lambda_btv: float = 0.08, alpha_btv: float = 0.7,
                            btv_neighbors: int = 1, edge_threshold: float = 12.0,
-                           detail_amount: float = 0.12) -> np.ndarray:
-    """Reconstruct an RGB image with adjoint IBP and edge-aware Huber-TV.
+                           detail_amount: float = 0.12,
+                           auto_tune: bool = True) -> np.ndarray:
+    """Reconstruct an RGB image with adaptive adjoint IBP and edge-aware Huber-TV.
 
     ``alpha_btv`` and ``btv_neighbors`` remain accepted for API compatibility
     but are intentionally unused: data-derived edge weights replace the old
     circularly shifted BTV neighbourhood, eliminating wraparound artifacts.
+
+    When ``auto_tune`` is enabled, the regularisation strength, PSF width,
+    edge threshold, and detail boost are adjusted per-image based on the
+    estimated noise level and local texture activity.
     """
     _validate_parameters(scale, iterations, lambda_ibp, sigma_psf, lambda_btv, edge_threshold, detail_amount)
     source = np.asarray(lr, dtype=np.float64)
@@ -245,16 +335,26 @@ def ibp_btv_super_resolve(lr: np.ndarray, scale: int, iterations: int = 20,
     y_lr, cb_lr, cr_lr = _rgb_to_ycbcr(source)
     y_hr = lanczos_resize(y_lr, scale)
     cb_hr, cr_hr = lanczos_resize(cb_lr, scale), lanczos_resize(cr_lr, scale)
+
+    if auto_tune:
+        lambda_btv, edge_threshold, sigma_psf, detail_amount, activity_hr = _adaptive_parameters(
+            y_lr, scale, lambda_btv, edge_threshold, sigma_psf, detail_amount
+        )
+    else:
+        activity_hr = np.zeros_like(y_hr)
+
     psf = _gaussian_kernel(sigma_psf)
-    horizontal_weight, vertical_weight = _edge_weights(y_hr, edge_threshold)
-    for _ in range(iterations):
+    horizontal_weight, vertical_weight = _adaptive_edge_weights(y_hr, edge_threshold, activity_hr)
+    for iteration in range(iterations):
         simulated_lr = downsample_area(_convolve_separable(y_hr, psf), scale)
         residual_lr = y_lr - simulated_lr
         correction = _convolve_separable_adjoint(_area_adjoint(residual_lr, scale), psf)
         y_hr += lambda_ibp * correction
-        y_hr = _edge_aware_huber_tv_step(y_hr, horizontal_weight, vertical_weight, lambda_btv)
+        # Anneal TV strength slightly for stable late-iteration convergence
+        tv_strength = lambda_btv * (0.75 + 0.25 * (1.0 - iteration / max(1, iterations - 1)))
+        y_hr = _edge_aware_huber_tv_step(y_hr, horizontal_weight, vertical_weight, tv_strength)
         y_hr = np.clip(y_hr, 0.0, 255.0)
-    y_hr = _edge_limited_detail(y_hr, detail_amount, edge_threshold)
+    y_hr = _adaptive_detail_lift(y_hr, detail_amount, edge_threshold, activity_hr)
     return np.clip(_ycbcr_to_rgb(y_hr, cb_hr, cr_hr), 0.0, 255.0)
 
 
@@ -283,6 +383,7 @@ def main() -> int:
     parser.add_argument("--lambda-btv", type=float, default=0.08, help="Edge-aware Huber-TV strength (default: 0.08).")
     parser.add_argument("--edge-threshold", type=float, default=12.0, help="Edge-preservation threshold in luma levels (default: 12).")
     parser.add_argument("--detail-amount", type=float, default=0.12, help="Bounded final edge-detail lift from 0 to 1 (default: 0.12).")
+    parser.add_argument("--no-auto-tune", action="store_true", help="Disable per-image adaptive parameter selection.")
     parser.add_argument("-o", "--output", default=None, help="Output path. Default is '<input>_x<scale>.<ext>'.")
     parser.add_argument("-q", "--quality", type=int, default=95, help="JPEG/WebP output quality (default: 95).")
     args = parser.parse_args()
@@ -304,7 +405,7 @@ def main() -> int:
         if args.method == "lanczos":
             result = lanczos_resize(image, args.scale)
         else:
-            result = ibp_btv_super_resolve(image, args.scale, args.iterations, args.lambda_ibp, args.sigma_psf, args.lambda_btv, edge_threshold=args.edge_threshold, detail_amount=args.detail_amount)
+            result = ibp_btv_super_resolve(image, args.scale, args.iterations, args.lambda_ibp, args.sigma_psf, args.lambda_btv, edge_threshold=args.edge_threshold, detail_amount=args.detail_amount, auto_tune=not args.no_auto_tune)
     except (OSError, ValueError) as error:
         print(f"Could not process image: {error}", file=sys.stderr)
         return 1
